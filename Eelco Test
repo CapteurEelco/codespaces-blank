@@ -1,0 +1,335 @@
+public ActionResult ImportTemplateFile(HttpPostedFileBase importFile = null)
+        {
+            try
+            {
+                string SessionLinkXLS = "";
+                int errorColNumber = 0;
+                int successNr = 0;
+                int failureNr = 0;
+
+                string templateType = "";
+                string updateType = "";
+
+                List<BatchImportBase> batches = new List<BatchImportBase>();
+                Dictionary<int, string> dataErrors = new Dictionary<int, string>();
+
+                if (importFile != null)
+                {
+                    using (ExcelPackage package = new ExcelPackage(importFile.InputStream))
+                    {
+                        ExcelWorksheet worksheet = package.Workbook.Worksheets.FirstOrDefault();
+                        if (worksheet != null)
+                        {
+                            Dictionary<string, int> fileColumns = new Dictionary<string, int>();
+
+                            string sheetName = worksheet.Workbook.Worksheets.First().Name; //Update, Create, Archive / Climate Group, Power Device, Footprint
+
+                            updateType = sheetName.Split(' ')[0];
+                            templateType = sheetName.Split(' ')[1];
+
+                            if (!"Update, Create, Archive".Contains(updateType) || !"Climate Group,Power Device,FootPrint".Contains(templateType))
+                            {
+                                throw new Exception("Sheet name should be formatted as '[Update/Create/Archive] [Climate Group/Power Device/FootPrint]'");
+                            }
+
+                            // Identify all column names
+                            for (int colNumber = 1; colNumber <= worksheet.Dimension.End.Column; colNumber++)
+                            {
+                                var cellValue = worksheet.GetValue(1, colNumber);
+                                if (cellValue != null && cellValue.ToString() == "Error")
+                                {
+                                    //Skip column
+                                    errorColNumber = colNumber;
+                                }
+                                else if (cellValue != null && !string.IsNullOrWhiteSpace(cellValue.ToString()) && !string.IsNullOrEmpty(cellValue.ToString()))
+                                {
+                                    string cv = cellValue.ToString();
+                                    fileColumns.Add(cv, colNumber);
+                                }
+                                else
+                                {
+                                    worksheet.Column(colNumber).Style.Fill.BackgroundColor.SetColor(Color.Red);
+                                    throw new Exception("Column " + colNumber + " is invalid");
+                                }
+                            }
+
+                            if (errorColNumber == 0)
+                            {
+                                throw new Exception("Missing Error column, cannot display errors.");
+                            }
+
+                            if (!fileColumns.ContainsKey("SiteName"))
+                            {
+                                throw new Exception("No Site found");
+                            }
+
+                            string importType = "";
+                            fileColumns.ToList().ForEach(e => importType += e.Key + ",");
+                            importType = importType.Substring(0, importType.Length - 1);
+
+                            // Loop over rows and create records
+                            for (int rowNumber = 3; rowNumber <= worksheet.Dimension.End.Row; rowNumber++)
+                            {
+                                int siteId = 0;
+
+                                try
+                                {
+                                    var siteCellValue = worksheet.GetValue(rowNumber, fileColumns["SiteName"]);
+                                    if (siteCellValue != null)
+                                    {
+                                        siteId = repo.GetSiteIdByName(siteCellValue.ToString());
+
+                                        if (siteId > 0 && !batches.Any(a => a.FK_SiteId == siteId))
+                                        {
+                                            batches.Add(new BatchImportBase() { FK_SiteId = siteId, UpdateType = updateType.Replace("Create", "Insert"), ImportType = importType, LogicalName = templateType + "Import" + DateTime.UtcNow.ToShortDateString(), CreateDate = DateTime.UtcNow, CreatedBy = User.Identity.Name });
+                                        }
+                                    }
+                                    else
+                                    {
+                                        throw new Exception("Invalid Site");
+                                    }
+
+                                    var batch = batches.FirstOrDefault(f => f.FK_SiteId == siteId);
+
+                                    if (batch != null)
+                                    {
+                                        var cr = new BatchImportClimateRecords();
+                                        var fr = new BatchImportFootPrintRecords();
+                                        var pr = new BatchImportPowerRecords();
+
+                                        foreach (var col in fileColumns.Where(w => w.Key != "SiteName"))
+                                        {
+                                            try
+                                            {
+                                                string propertyValue = (worksheet.GetValue(rowNumber, col.Value) ?? "").ToString().Trim();                                                                                                
+
+                                                if (templateType == "Climate")
+                                                {
+                                                    cr.SetProperty(col.Key, propertyValue);
+                                                }
+                                                else if (templateType == "Power")
+                                                {
+                                                    pr.SetProperty(col.Key, propertyValue);
+                                                }
+                                                else if (templateType == "FootPrint")
+                                                {
+                                                    fr.SetProperty(col.Key, propertyValue);
+                                                }
+                                            }
+                                            catch
+                                            {
+                                                throw new Exception(col.Key + " has an invalid value");
+                                            }
+                                        }
+
+                                        if (templateType == "Climate")
+                                        {
+                                            if (updateType == "Create")
+                                            {
+                                                cr.BusinessKey = "NEW_" + rowNumber;
+                                            }
+
+                                            batch.BatchImportClimateRecords.Add(cr);
+                                        }
+                                        else if (templateType == "Power")
+                                        {
+                                            if (updateType == "Create")
+                                            {
+                                                pr.BusinessKey = "NEW_" + rowNumber;
+                                            }
+
+                                            batch.BatchImportPowerRecords.Add(pr);
+                                        }
+                                        else if (templateType == "FootPrint")
+                                        {
+                                            if (updateType == "Create")
+                                            {
+                                                fr.BusinessKey = "NEW_" + rowNumber;
+                                            }
+
+                                            batch.BatchImportFootPrintRecords.Add(fr);
+                                        }
+
+                                        successNr++;
+                                    }
+                                    else
+                                    {
+                                        throw new Exception("Batch not found");
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    dataErrors.Add(rowNumber, ex.Message);
+                                    failureNr++;
+                                }
+                            }
+                        }
+
+                        string batchIds = "";
+                        string prettyImportRows = "<ul>";
+                        string prettyExceptions = "<ul>";
+
+                        Dictionary<int, string> BatchValidationMessages = new Dictionary<int, string>(); //Excel Row Number / Validation Msg
+                        List<DbEntityValidationException> validationErrors = new List<DbEntityValidationException>();
+
+                        if (templateType == "Climate")
+                        {
+                            if (batches.Where(w => w.BatchImportClimateRecords.Count > 0).Count() > 0)
+                            {
+                                foreach (var b in batches.Where(w => w.BatchImportClimateRecords.Count > 0))
+                                {
+                                    try
+                                    {
+                                        db.BatchImportBase.Add(b);
+                                        db.SaveChanges();
+
+                                        batchIds += b.BatchImportBaseId + ",";
+
+                                        foreach (var cr in importRepo.ProcessImportClimateBatch(b.BatchImportBaseId, true))
+                                        {
+                                            if (!String.IsNullOrEmpty(cr.ValidationMessage))
+                                            {
+                                                int rn = int.Parse(cr.BusinessKey.Remove(0, 4));
+                                                BatchValidationMessages.Add(rn, cr.ValidationMessage);
+                                                failureNr++;
+                                            }
+                                        }
+                                    }
+                                    catch (DbEntityValidationException ef)
+                                    {
+                                        validationErrors.Add(ef);
+                                    }
+                                }
+                            }
+                        }
+                        else if (templateType == "Power")
+                        {
+                            if (batches.Where(w => w.BatchImportPowerRecords.Count > 0).Count() > 0)
+                            {
+                                foreach (var b in batches.Where(w => w.BatchImportPowerRecords.Count > 0))
+                                {
+                                    try
+                                    {
+                                        db.BatchImportBase.Add(b);
+                                        db.SaveChanges();
+
+                                        batchIds += b.BatchImportBaseId + ",";
+
+                                        foreach (var cr in importRepo.ProcessImportPowerBatch(b.BatchImportBaseId, true))
+                                        {
+                                            if (!String.IsNullOrEmpty(cr.ValidationMessage))
+                                            {
+                                                int rn = int.Parse(cr.BusinessKey.Remove(0, 4));
+                                                BatchValidationMessages.Add(rn, cr.ValidationMessage);
+                                                failureNr++;
+                                            }
+                                        }
+                                    }
+                                    catch (DbEntityValidationException ef)
+                                    {
+                                        validationErrors.Add(ef);
+                                    }
+                                }
+                            }
+                        }
+                        else if (templateType == "FootPrint")
+                        {
+                            if (batches.Where(w => w.BatchImportFootPrintRecords.Count > 0).Count() > 0)
+                            {
+                                foreach (var b in batches.Where(w => w.BatchImportFootPrintRecords.Count > 0))
+                                {
+                                    try
+                                    {
+                                        db.BatchImportBase.Add(b);
+                                        db.SaveChanges();
+
+                                        batchIds += b.BatchImportBaseId + ",";
+
+                                        foreach (var cr in importRepo.ProcessImportFootprintBatch(b.BatchImportBaseId, true))
+                                        {
+                                            if (!String.IsNullOrEmpty(cr.ValidationMessage))
+                                            {
+                                                int rn = int.Parse(cr.BusinessKey.Remove(0, 4));
+                                                BatchValidationMessages.Add(rn, cr.ValidationMessage);
+                                                failureNr++;
+                                            }
+                                        }
+                                    }
+                                    catch (DbEntityValidationException ef)
+                                    {
+                                        validationErrors.Add(ef);
+                                    }
+                                }
+                            }
+                        }
+
+                        //Data errors 
+                        foreach (var ir in dataErrors)
+                        {
+                            prettyExceptions += "<li class='importFail'>[Row: " + ir.Key + "] " + ir.Value + "</li>";
+                            worksheet.AddErrorToWorksheet(errorColNumber, ir.Key, ir.Value);
+                        }
+
+                        //DB errors
+                        foreach (var msg in BatchValidationMessages)
+                        {
+                            prettyExceptions += "<li class='importFail'>[Row: " + msg.Key + "] " + msg.Value + "</li>";
+                            worksheet.AddErrorToWorksheet(errorColNumber, msg.Key, msg.Value);
+                        }
+
+                        if (batchIds.Length > 0)
+                        {
+                            batchIds = batchIds.Substring(0, batchIds.Length - 1);
+                        }
+
+                        if (validationErrors.Count > 0)
+                        {
+                            foreach (var ef in validationErrors)
+                            {
+                                if (ef.EntityValidationErrors != null)
+                                {
+                                    foreach (var error in ef.EntityValidationErrors)
+                                    {
+                                        foreach (var suberror in error.ValidationErrors)
+                                        {
+                                            prettyExceptions += "<li class='importFail'>" + suberror.ErrorMessage + "</li>";
+                                            failureNr++;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        prettyExceptions += "</ul>";
+                        prettyImportRows += "</ul>";
+
+                        //Save updated XLS
+                        //Guid g = Guid.NewGuid();
+                        SessionLinkXLS = "XLS-UPDATED"; // + g;
+
+                        string fn = importFile.FileName + " (Import result " + DateTime.UtcNow.ToShortDateString() + ")";
+                        Session[SessionLinkXLS] = package.DownloadAsExcel(fn);
+
+                        return Json(new { Status = 200, successNr = successNr, failureNr, Exceptions = prettyExceptions, ImportRows = prettyImportRows, BatchIds = batchIds, templateType, SessionLinkXLS }, JsonRequestBehavior.AllowGet);
+                    }
+                }
+
+                return Json(new { Status = 500, successNr = 0, failureNr = 0, Exceptions = "Invalid import file", ImportRows = "" });
+            }
+            catch (Exception e)
+            {
+                string ix = "";
+
+                if (e.InnerException != null)
+                {
+                    ix = e.InnerException.ToString();
+
+                    if (e.InnerException.InnerException != null)
+                    {
+                        ix += " | " + e.InnerException.InnerException.ToString();
+                    }
+                }
+
+                return Json(new { Status = 500, successNr = 0, failureNr = 0, Exceptions = e.Message + "<br/><br/>" + ix, ImportRows = "" });
+            }
+        }
